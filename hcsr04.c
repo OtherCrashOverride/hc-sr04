@@ -13,167 +13,282 @@
 #include <linux/kdev_t.h>
 #include <linux/interrupt.h> 
 
+#include <linux/amlogic/aml_gpio_consumer.h>
+#include <linux/amlogic/gpio-amlogic.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+
 MODULE_LICENSE("Dual BSD/GPL");
-MODULE_AUTHOR("Sergio Tanzilli");
+MODULE_AUTHOR("Sergio Tanzilli, OtherCrashOverride");
 MODULE_DESCRIPTION("Driver for HC-SR04 ultrasonic sensor");
 
-// Change these two lines to use differents GPIOs
-#define HCSR04_ECHO		95 // J4.32 -   PC31
-#define HCSR04_TRIGGER	91 // J4.30 -   PC27
-//#define HCSR04_TEST  	 5 // J4.28 -   PA5
 
-// adaptation for kernels >= 4.1.0
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(4,1,0)
-    #define  IRQF_DISABLED 0
-#endif
+// TODO: Refactor to allow multiple instances for using more
+//       than once sensor.  This is complicated by the Amlogic
+//       GPIO IRQ limit of (8) entries.  Rising and falling
+//       each require a hardware entry thus limiting it to 
+//       four (8 / 2 = 4).
 
-static int gpio_irq=-1;
-static int valid_value = 0;
+typedef enum _HCSR04STATUS
+{
+	HCSR04STATUS_READY = 0,
+	HCSR04STATUS_WAITING_FOR_ECHO_START,
+	HCSR04STATUS_WAITING_FOR_ECHO_STOP,
+	HCSR04STATUS_COMPLETE
+} HCSR04STATUS;
 
-static ktime_t echo_start;
-static ktime_t echo_end;
- 
+
+static int rising_irq = -1;
+static int falling_irq = -1;
+
+volatile static HCSR04STATUS status = HCSR04STATUS_READY;
+volatile static ktime_t echo_start;
+volatile static ktime_t echo_end;
+
+DECLARE_WAIT_QUEUE_HEAD(wq);
+
+static const char* GPIO_OWNER = "hcsr04";
+
+
+// Default GPIOs.  Use parameters during module load to override.
+// TODO: add IRQ setting parameters
+static int trigger_gpio = 104;	// J2 - Pin16
+module_param(trigger_gpio, int, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(trigger_gpio, "Trigger GPIO pin number");
+
+static int echo_gpio = 102;		// J2 - Pin18
+module_param(echo_gpio, int, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(echo_gpio, "Echo GPIO pin number");
+
+
 // This function is called when you write something on /sys/class/hcsr04/value
-static ssize_t hcsr04_value_write(struct class *class, struct class_attribute *attr, const char *buf, size_t len) {
-	printk(KERN_INFO "Buffer len %d bytes\n", len);
+static ssize_t hcsr04_value_write(struct class *class, struct class_attribute *attr, const char *buf, size_t len)
+{
+	// Currently unused
 	return len;
 }
 
 // This function is called when you read /sys/class/hcsr04/value
-static ssize_t hcsr04_value_read(struct class *class, struct class_attribute *attr, char *buf) {
-	int counter;
+// Note: https://www.kernel.org/doc/Documentation/filesystems/sysfs.txt
+//		 "sysfs allocates a buffer of size (PAGE_SIZE) and passes it to the
+//		 method."
+static ssize_t hcsr04_value_read(struct class *class, struct class_attribute *attr, char *buf)
+{
+	int waitResult;
+	int returnValue;
+
+	// Set the status first to ensure its valid when IRQ fires
+	status = HCSR04STATUS_WAITING_FOR_ECHO_START;
 
 	// Send a 10uS impulse to the TRIGGER line
-	gpio_set_value(HCSR04_TRIGGER,1);
+	amlogic_set_value(trigger_gpio, 1, GPIO_OWNER);
 	udelay(10);
-	gpio_set_value(HCSR04_TRIGGER,0);
-	valid_value=0;
+	amlogic_set_value(trigger_gpio, 0, GPIO_OWNER);
 
-	counter=0;
-	while (valid_value==0) {
-		// Out of range
-		if (++counter>23200) {
-			return sprintf(buf, "%d\n", -1);;
-		}
-		udelay(1);
+	// Timemout is 38ms if no obstacle detected according to spec
+	waitResult = wait_event_timeout(wq, status == HCSR04STATUS_COMPLETE, 38 * HZ / 1000);
+	status = HCSR04STATUS_READY;
+
+	if (waitResult == 0)
+	{	// Timeout occured
+		returnValue = sprintf(buf, "%d\n", -1);
 	}
-	
-	//printk(KERN_INFO "Sub: %lld\n", ktime_to_us(ktime_sub(echo_end,echo_start)));
-	return sprintf(buf, "%lld\n", ktime_to_us(ktime_sub(echo_end,echo_start)));;
+	else
+	{
+		returnValue = sprintf(buf, "%lld\n", ktime_to_us(ktime_sub(echo_end, echo_start)));
+	}
+
+	return returnValue;
 }
 
 // Sysfs definitions for hcsr04 class
-static struct class_attribute hcsr04_class_attrs[] = {
-	__ATTR(value,	S_IRUGO | S_IWUSR, hcsr04_value_read, hcsr04_value_write),
+static struct class_attribute hcsr04_class_attrs[] =
+{
+	__ATTR(value, S_IRUGO | S_IWUSR, hcsr04_value_read, hcsr04_value_write),
 	__ATTR_NULL,
 };
 
 // Name of directory created in /sys/class
-static struct class hcsr04_class = {
-	.name =			"hcsr04",
-	.owner =		THIS_MODULE,
-	.class_attrs =	hcsr04_class_attrs,
+static struct class hcsr04_class =
+{
+	.name = "hcsr04",
+	.owner = THIS_MODULE,
+	.class_attrs = hcsr04_class_attrs,
 };
 
 // Interrupt handler on ECHO signal
-static irqreturn_t gpio_isr(int irq, void *data)
+static irqreturn_t gpio_isr_rising(int irq, void *data)
 {
-	ktime_t ktime_dummy;
+	// Rising edge
+	if (status == HCSR04STATUS_WAITING_FOR_ECHO_START)
+	{
+		echo_start = ktime_get();
+		echo_end = echo_start;
 
-	//gpio_set_value(HCSR04_TEST,1);
-
-	if (valid_value==0) {
-		ktime_dummy=ktime_get();
-		if (gpio_get_value(HCSR04_ECHO)==1) {
-			echo_start=ktime_dummy;
-		} else {
-			echo_end=ktime_dummy;
-			valid_value=1;
-		}
+		status = HCSR04STATUS_WAITING_FOR_ECHO_STOP;
 	}
 
-	//gpio_set_value(HCSR04_TEST,0);
+	return IRQ_HANDLED;
+}
+
+static irqreturn_t gpio_isr_falling(int irq, void *data)
+{
+	// Falling edge
+	if (status == HCSR04STATUS_WAITING_FOR_ECHO_STOP)
+	{
+		echo_end = ktime_get();
+		status = HCSR04STATUS_COMPLETE;
+
+		wake_up(&wq);
+	}
+
 	return IRQ_HANDLED;
 }
 
 static int hcsr04_init(void)
-{	
+{
 	int rtc;
-	
-	printk(KERN_INFO "HC-SR04 driver v0.32 initializing.\n");
 
-	if (class_register(&hcsr04_class)<0) goto fail;
+	printk(KERN_INFO "HC-SR04 driver initializing.\n");
+	printk(KERN_INFO "Trigger GPIO: %d.\n", trigger_gpio);
+	printk(KERN_INFO "Echo GPIO: %d.\n", echo_gpio);
 
-	//rtc=gpio_request(HCSR04_TEST,"TEST");
-	//if (rtc!=0) {
-	//	printk(KERN_INFO "Error %d\n",__LINE__);
-	//	goto fail;
-	//}
-
-	//rtc=gpio_direction_output(HCSR04_TEST,0);
-	//if (rtc!=0) {
-	//	printk(KERN_INFO "Error %d\n",__LINE__);
-	//	goto fail;
-	//}
-
-	rtc=gpio_request(HCSR04_TRIGGER,"TRIGGER");
-	if (rtc!=0) {
-		printk(KERN_INFO "Error %d\n",__LINE__);
-		goto fail;
-	}
-
-	rtc=gpio_request(HCSR04_ECHO,"ECHO");
-	if (rtc!=0) {
-		printk(KERN_INFO "Error %d\n",__LINE__);
-		goto fail;
-	}
-
-	rtc=gpio_direction_output(HCSR04_TRIGGER,0);
-	if (rtc!=0) {
-		printk(KERN_INFO "Error %d\n",__LINE__);
-		goto fail;
-	}
-
-	rtc=gpio_direction_input(HCSR04_ECHO);
-	if (rtc!=0) {
-		printk(KERN_INFO "Error %d\n",__LINE__);
-		goto fail;
-	}
-
-	// http://lwn.net/Articles/532714/
-	rtc=gpio_to_irq(HCSR04_ECHO);
-	if (rtc<0) {
-		printk(KERN_INFO "Error %d\n",__LINE__);
-		goto fail;
-	} else {
-		gpio_irq=rtc;
-	}
-
-	rtc = request_irq(gpio_irq, gpio_isr, IRQF_TRIGGER_RISING | IRQF_TRIGGER_FALLING | IRQF_DISABLED , "hc-sr04.trigger", NULL);
-
-	if(rtc) {
-		printk(KERN_ERR "Unable to request IRQ: %d\n", rtc);
-		goto fail;
+	if (class_register(&hcsr04_class) < 0)
+	{
+		goto fail_1;
 	}
 
 
+	// Setup TRIGGER gpio
+	rtc = amlogic_gpio_request(trigger_gpio, GPIO_OWNER);
+	if (rtc != 0)
+	{
+		printk(KERN_ERR "Trigger GPIO request failed.\n");
+		goto fail_2;
+	}
+
+	rtc = amlogic_gpio_direction_output(trigger_gpio, 0, GPIO_OWNER);
+	if (rtc != 0)
+	{
+		printk(KERN_ERR "Trigger GPIO direction set failed.");
+		goto fail_3;
+	}
+
+	amlogic_set_value(trigger_gpio, 0, GPIO_OWNER);
+
+
+	// Setup ECHO gpio
+	rtc = amlogic_gpio_request(echo_gpio, GPIO_OWNER);
+	if (rtc != 0) 
+	{
+		printk(KERN_ERR "Echo GPIO request failed.\n");
+		goto fail_3;
+	}
+
+	rtc = amlogic_gpio_direction_input(echo_gpio, GPIO_OWNER);
+	if (rtc != 0) 
+	{
+		printk(KERN_ERR "Echo GPIO direction set failed.\n");
+		goto fail_4;
+	}
+
+	//amlogic_set_pull_up_down(echo_gpio, 1, ECHO_OWNER);
+	amlogic_disable_pullup(echo_gpio, GPIO_OWNER);
+
+
+	// http://forum.odroid.com/viewtopic.php?f=115&t=8958#p70802
+	/*
+		IRQ Trigger Select : (0 ~ 3)
+			GPIO_IRQ_HIGH = 0, GPIO_IRQ_LOW = 1, GPIO_IRQ_RISING = 2, GPIO_IRQ_FALLING = 3
+
+		IRQ Filter Select : 7
+			Value 0 : No Filtering, Value 1 ~ 7 : value * 3 * 111nS(delay)
+	*/
+
+	// Set RISING irq
+	rising_irq = (GPIO_IRQ0 + INT_GPIO_0);
+	rtc = amlogic_gpio_to_irq(echo_gpio, GPIO_OWNER, AML_GPIO_IRQ(rising_irq, FILTER_NUM1, GPIO_IRQ_RISING));
+	if (rtc < 0)
+	{
+		printk(KERN_ERR "Rising IRQ mapping failed.\n");
+		goto fail_4;
+	}
+
+	rtc = request_irq(rising_irq, (irq_handler_t)gpio_isr_rising, IRQF_DISABLED, "hc-sr04", NULL);
+	if (rtc)
+	{
+		printk(KERN_ERR "Rising IRQ:%d request failed. (Error=%d)\n", rising_irq, rtc);
+		goto fail_4;
+	}
+	else
+	{
+		printk(KERN_ERR "Rising IRQ:%d\n", rising_irq);
+	}
+
+
+	// Set FALLING irq
+	falling_irq = (GPIO_IRQ1 + INT_GPIO_0);
+	rtc = amlogic_gpio_to_irq(echo_gpio, GPIO_OWNER, AML_GPIO_IRQ(falling_irq, FILTER_NUM1, GPIO_IRQ_FALLING));
+	if (rtc < 0)
+	{
+		printk(KERN_ERR "Falling IRQ mapping failed.\n");
+		goto fail_4;
+	}
+
+	rtc = request_irq(falling_irq, (irq_handler_t)gpio_isr_falling, IRQF_DISABLED, "hc-sr04", NULL);
+	if (rtc)
+	{
+		printk(KERN_ERR "Falling IRQ:%d request failed. (Error=%d)\n", falling_irq, rtc);
+		goto fail_5;
+	}
+	else
+	{
+		printk(KERN_ERR "Falling IRQ:%d\n", falling_irq);
+	}
+
+
+	printk(KERN_INFO "HC-SR04 driver installed.\n");
 	return 0;
 
-fail:
+fail_5:
+	if (rising_irq != -1)
+	{
+		free_irq(rising_irq, NULL);
+	}
+
+fail_4:
+	amlogic_gpio_free(echo_gpio, GPIO_OWNER);
+
+fail_3:
+	amlogic_gpio_free(trigger_gpio, GPIO_OWNER);
+
+fail_2:
+	class_unregister(&hcsr04_class);
+
+fail_1:
 	return -1;
 
 }
- 
+
 static void hcsr04_exit(void)
 {
-	if (gpio_irq!=-1) {	
-		free_irq(gpio_irq, NULL);
+	if (falling_irq != -1)
+	{
+		free_irq(falling_irq, NULL);
 	}
-	gpio_free(HCSR04_TRIGGER);
-	gpio_free(HCSR04_ECHO);
+
+	if (rising_irq != -1)
+	{
+		free_irq(rising_irq, NULL);
+	}
+
+	amlogic_gpio_free(echo_gpio, GPIO_OWNER);
+	amlogic_gpio_free(trigger_gpio, GPIO_OWNER);
+
 	class_unregister(&hcsr04_class);
-	printk(KERN_INFO "HC-SR04 disabled.\n");
+
+	printk(KERN_INFO "HC-SR04 driver removed.\n");
 }
- 
+
 module_init(hcsr04_init);
 module_exit(hcsr04_exit);
